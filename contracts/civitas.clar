@@ -1,11 +1,11 @@
 ;; Civitas DAO - A decentralized autonomous organization for treasury management
-;; Contributors can propose spending and vote on proposals
+;; Contributors can propose spending and vote on proposals with weighted voting
 
 ;; =============================================================================
 ;; CONSTANTS & ERRORS
 ;; =============================================================================
 
-(define-constant MIN_VOTE_THRESHOLD u2)
+(define-constant MIN_VOTE_THRESHOLD u51) ;; 51% of total contribution weight needed
 (define-constant PROPOSAL_LIFETIME u100) ;; blocks
 (define-constant MIN_CONTRIBUTION u1000000) ;; 1 STX minimum contribution
 (define-constant MAX_PROPOSAL_AMOUNT u1000000000000) ;; 1M STX max proposal
@@ -31,6 +31,7 @@
 ;; =============================================================================
 
 (define-data-var next-proposal-id uint u0)
+(define-data-var total-contributions uint u0) ;; Track total contributions for weighted voting
 
 ;; =============================================================================
 ;; DATA MAPS
@@ -45,30 +46,46 @@
   }
 )
 
-;; Store proposal details
+;; Store proposal details with weighted vote tracking
 (define-map proposals
   uint
   {
     amount: uint,
     recipient: principal,
     description: (string-ascii 100),
-    yes-votes: uint,
-    no-votes: uint,
+    yes-vote-weight: uint,
+    no-vote-weight: uint,
     executed: bool,
     start-block: uint,
-    proposer: principal
+    proposer: principal,
+    total-weight-at-creation: uint ;; Snapshot of total contributions when proposal was created
   }
 )
 
 ;; Track votes to prevent double voting
 (define-map votes
   {proposal-id: uint, voter: principal}
-  {voted: bool, support: bool}
+  {voted: bool, support: bool, weight: uint}
 )
 
 ;; =============================================================================
 ;; PRIVATE FUNCTIONS
 ;; =============================================================================
+
+;; Calculate vote weight percentage (returns percentage * 100 for precision)
+(define-private (calculate-vote-percentage (vote-weight uint) (total-weight uint))
+  (if (is-eq total-weight u0)
+    u0
+    (/ (* vote-weight u10000) total-weight) ;; Multiply by 10000 for 2 decimal precision
+  )
+)
+
+;; Check if proposal has sufficient weighted votes (51% threshold)
+(define-private (has-sufficient-weighted-votes (yes-weight uint) (total-weight uint))
+  (let ((yes-percentage (calculate-vote-percentage yes-weight total-weight)))
+    (>= yes-percentage u5100) ;; 51% * 100 for precision
+  )
+)
 
 ;; Validate proposal ID input
 (define-private (validate-proposal-id (proposal-id uint))
@@ -91,16 +108,20 @@
   (not (is-eq recipient (as-contract tx-sender)))
 )
 
-;; Check if a user is a contributor
-(define-private (is-contributor (user principal))
+;; Check if a user is a contributor and return their contribution amount
+(define-private (get-contributor-weight (user principal))
   (match (map-get? contributors user)
-    contributor-data (ok (get contributed contributor-data))
+    contributor-data 
+    (if (get contributed contributor-data)
+      (ok (get amount contributor-data))
+      (err ERR_NOT_CONTRIBUTOR)
+    )
     (err ERR_NOT_CONTRIBUTOR)
   )
 )
 
 ;; Check if proposal is still active (not expired and not executed)
-(define-private (is-proposal-active (proposal-data {amount: uint, recipient: principal, description: (string-ascii 100), yes-votes: uint, no-votes: uint, executed: bool, start-block: uint, proposer: principal}))
+(define-private (is-proposal-active (proposal-data {amount: uint, recipient: principal, description: (string-ascii 100), yes-vote-weight: uint, no-vote-weight: uint, executed: bool, start-block: uint, proposer: principal, total-weight-at-creation: uint}))
   (let (
     (executed (get executed proposal-data))
     (start (get start-block proposal-data))
@@ -125,15 +146,21 @@
     (match (map-get? contributors tx-sender)
       existing-contributor
       ;; Update existing contributor
-      (map-set contributors tx-sender {
-        contributed: true,
-        amount: (+ (get amount existing-contributor) amount)
-      })
+      (begin
+        (map-set contributors tx-sender {
+          contributed: true,
+          amount: (+ (get amount existing-contributor) amount)
+        })
+        (var-set total-contributions (+ (var-get total-contributions) amount))
+      )
       ;; New contributor
-      (map-set contributors tx-sender {
-        contributed: true,
-        amount: amount
-      })
+      (begin
+        (map-set contributors tx-sender {
+          contributed: true,
+          amount: amount
+        })
+        (var-set total-contributions (+ (var-get total-contributions) amount))
+      )
     )
     (ok amount)
   )
@@ -145,9 +172,10 @@
     ;; Validate all inputs
     (asserts! (validate-amount amount) (err ERR_INVALID_AMOUNT))
     (asserts! (validate-recipient recipient) (err ERR_INVALID_RECIPIENT))
-    (try! (is-contributor tx-sender))
+    (try! (get-contributor-weight tx-sender))
     
-    (let ((proposal-id (var-get next-proposal-id)))
+    (let ((proposal-id (var-get next-proposal-id))
+          (current-total-weight (var-get total-contributions)))
       ;; Ensure we don't overflow proposal IDs
       (asserts! (< proposal-id MAX_PROPOSAL_ID) (err ERR_INVALID_PROPOSAL_ID))
       
@@ -155,11 +183,12 @@
         amount: amount,
         recipient: recipient,
         description: description,
-        yes-votes: u0,
-        no-votes: u0,
+        yes-vote-weight: u0,
+        no-vote-weight: u0,
         executed: false,
         start-block: stacks-block-height,
-        proposer: tx-sender
+        proposer: tx-sender,
+        total-weight-at-creation: current-total-weight
       })
       (var-set next-proposal-id (+ proposal-id u1))
       (ok proposal-id)
@@ -167,41 +196,42 @@
   )
 )
 
-;; Vote on a proposal
+;; Vote on a proposal with weighted voting
 (define-public (vote (proposal-id uint) (support bool))
   (begin
     ;; Validate inputs
     (asserts! (validate-proposal-id proposal-id) (err ERR_INVALID_PROPOSAL_ID))
-    (try! (is-contributor tx-sender))
-    
-    (match (map-get? proposals proposal-id)
-      proposal-data
-      (let (
-        (vote-key {proposal-id: proposal-id, voter: tx-sender})
-      )
-        (asserts! (is-proposal-active proposal-data) (err ERR_PROPOSAL_EXPIRED))
-        (asserts! (is-none (map-get? votes vote-key)) (err ERR_ALREADY_VOTED))
-        
-        ;; Record the vote
-        (map-set votes vote-key {voted: true, support: support})
-        
-        ;; Update proposal vote counts
-        (if support
-          (map-set proposals proposal-id (merge proposal-data {
-            yes-votes: (+ (get yes-votes proposal-data) u1)
-          }))
-          (map-set proposals proposal-id (merge proposal-data {
-            no-votes: (+ (get no-votes proposal-data) u1)
-          }))
+    (let ((voter-weight (try! (get-contributor-weight tx-sender))))
+      
+      (match (map-get? proposals proposal-id)
+        proposal-data
+        (let (
+          (vote-key {proposal-id: proposal-id, voter: tx-sender})
         )
-        (ok true)
+          (asserts! (is-proposal-active proposal-data) (err ERR_PROPOSAL_EXPIRED))
+          (asserts! (is-none (map-get? votes vote-key)) (err ERR_ALREADY_VOTED))
+          
+          ;; Record the vote with weight
+          (map-set votes vote-key {voted: true, support: support, weight: voter-weight})
+          
+          ;; Update proposal vote weights
+          (if support
+            (map-set proposals proposal-id (merge proposal-data {
+              yes-vote-weight: (+ (get yes-vote-weight proposal-data) voter-weight)
+            }))
+            (map-set proposals proposal-id (merge proposal-data {
+              no-vote-weight: (+ (get no-vote-weight proposal-data) voter-weight)
+            }))
+          )
+          (ok true)
+        )
+        (err ERR_PROPOSAL_NOT_FOUND)
       )
-      (err ERR_PROPOSAL_NOT_FOUND)
     )
   )
 )
 
-;; Execute proposal if it meets threshold and requirements
+;; Execute proposal if it meets weighted threshold and requirements
 (define-public (execute-proposal (proposal-id uint))
   (begin
     ;; Validate input
@@ -213,7 +243,8 @@
         (executed (get executed proposal-data))
         (start (get start-block proposal-data))
         (expired (> (- stacks-block-height start) PROPOSAL_LIFETIME))
-        (yes-votes (get yes-votes proposal-data))
+        (yes-vote-weight (get yes-vote-weight proposal-data))
+        (total-weight (get total-weight-at-creation proposal-data))
         (proposal-amount (get amount proposal-data))
         (proposal-recipient (get recipient proposal-data))
         (balance (stx-get-balance (as-contract tx-sender)))
@@ -221,7 +252,7 @@
         ;; Validate proposal state and requirements
         (asserts! (not executed) (err ERR_PROPOSAL_ALREADY_EXECUTED))
         (asserts! (not expired) (err ERR_PROPOSAL_EXPIRED_EXEC))
-        (asserts! (>= yes-votes MIN_VOTE_THRESHOLD) (err ERR_INSUFFICIENT_VOTES))
+        (asserts! (has-sufficient-weighted-votes yes-vote-weight total-weight) (err ERR_INSUFFICIENT_VOTES))
         (asserts! (>= balance proposal-amount) (err ERR_INSUFFICIENT_BALANCE))
         
         ;; Re-validate the stored data before execution
@@ -261,6 +292,11 @@
   (stx-get-balance (as-contract tx-sender))
 )
 
+;; Get total contributions (voting weight)
+(define-read-only (get-total-contributions)
+  (var-get total-contributions)
+)
+
 ;; Check if user is a contributor
 (define-read-only (is-user-contributor (user principal))
   (match (map-get? contributors user)
@@ -283,6 +319,18 @@
   )
 )
 
+;; Get voting power percentage for a contributor
+(define-read-only (get-voting-power (user principal))
+  (match (map-get? contributors user)
+    contributor-data
+    (let ((user-weight (get amount contributor-data))
+          (total-weight (var-get total-contributions)))
+      (ok (calculate-vote-percentage user-weight total-weight))
+    )
+    (ok u0)
+  )
+)
+
 ;; Get next proposal ID
 (define-read-only (get-next-proposal-id)
   (var-get next-proposal-id)
@@ -295,6 +343,33 @@
     (asserts! (validate-proposal-id proposal-id) (err ERR_INVALID_PROPOSAL_ID))
     (match (map-get? proposals proposal-id)
       proposal-data (ok (is-proposal-active proposal-data))
+      (err ERR_PROPOSAL_NOT_FOUND)
+    )
+  )
+)
+
+;; Get proposal voting status with percentages
+(define-read-only (get-proposal-voting-status (proposal-id uint))
+  (begin
+    (asserts! (validate-proposal-id proposal-id) (err ERR_INVALID_PROPOSAL_ID))
+    (match (map-get? proposals proposal-id)
+      proposal-data
+      (let (
+        (yes-weight (get yes-vote-weight proposal-data))
+        (no-weight (get no-vote-weight proposal-data))
+        (total-weight (get total-weight-at-creation proposal-data))
+        (yes-percentage (calculate-vote-percentage yes-weight total-weight))
+        (no-percentage (calculate-vote-percentage no-weight total-weight))
+      )
+        (ok {
+          yes-weight: yes-weight,
+          no-weight: no-weight,
+          total-weight: total-weight,
+          yes-percentage: yes-percentage,
+          no-percentage: no-percentage,
+          passes-threshold: (has-sufficient-weighted-votes yes-weight total-weight)
+        })
+      )
       (err ERR_PROPOSAL_NOT_FOUND)
     )
   )
