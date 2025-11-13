@@ -25,6 +25,7 @@
 (define-constant ERR_INVALID_AMOUNT u400)
 (define-constant ERR_INVALID_PROPOSAL_ID u401)
 (define-constant ERR_INVALID_RECIPIENT u402)
+(define-constant ERR_WEIGHT_AFTER_SNAPSHOT u403)
 
 ;; =============================================================================
 ;; DATA VARIABLES
@@ -42,7 +43,8 @@
   principal
   {
     contributed: bool,
-    amount: uint
+    amount: uint,
+    last-contribution-proposal-id: uint
   }
 )
 
@@ -108,12 +110,12 @@
   (not (is-eq recipient (as-contract tx-sender)))
 )
 
-;; Check if a user is a contributor and return their contribution amount
-(define-private (get-contributor-weight (user principal))
+;; Check if a user is a contributor and return their stored data
+(define-private (get-contributor-data (user principal))
   (match (map-get? contributors user)
     contributor-data 
     (if (get contributed contributor-data)
-      (ok (get amount contributor-data))
+      (ok contributor-data)
       (err ERR_NOT_CONTRIBUTOR)
     )
     (err ERR_NOT_CONTRIBUTOR)
@@ -143,23 +145,30 @@
     (asserts! (<= amount MAX_PROPOSAL_AMOUNT) (err ERR_INVALID_AMOUNT))
     
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-    (match (map-get? contributors tx-sender)
-      existing-contributor
-      ;; Update existing contributor
-      (begin
-        (map-set contributors tx-sender {
-          contributed: true,
-          amount: (+ (get amount existing-contributor) amount)
-        })
-        (var-set total-contributions (+ (var-get total-contributions) amount))
-      )
-      ;; New contributor
-      (begin
-        (map-set contributors tx-sender {
-          contributed: true,
-          amount: amount
-        })
-        (var-set total-contributions (+ (var-get total-contributions) amount))
+    (let ((current-proposal-id (var-get next-proposal-id)))
+      (match (map-get? contributors tx-sender)
+        existing-contributor
+        ;; Update existing contributor
+        (let (
+          (existing-amount (get amount existing-contributor))
+          (new-amount (+ existing-amount amount))
+        )
+          (map-set contributors tx-sender {
+            contributed: true,
+            amount: new-amount,
+            last-contribution-proposal-id: current-proposal-id
+          })
+          (var-set total-contributions (+ (var-get total-contributions) amount))
+        )
+        ;; New contributor
+        (begin
+          (map-set contributors tx-sender {
+            contributed: true,
+            amount: amount,
+            last-contribution-proposal-id: current-proposal-id
+          })
+          (var-set total-contributions (+ (var-get total-contributions) amount))
+        )
       )
     )
     (ok amount)
@@ -172,7 +181,7 @@
     ;; Validate all inputs
     (asserts! (validate-amount amount) (err ERR_INVALID_AMOUNT))
     (asserts! (validate-recipient recipient) (err ERR_INVALID_RECIPIENT))
-    (try! (get-contributor-weight tx-sender))
+    (try! (get-contributor-data tx-sender))
     
     (let ((proposal-id (var-get next-proposal-id))
           (current-total-weight (var-get total-contributions)))
@@ -201,13 +210,15 @@
   (begin
     ;; Validate inputs
     (asserts! (validate-proposal-id proposal-id) (err ERR_INVALID_PROPOSAL_ID))
-    (let ((voter-weight (try! (get-contributor-weight tx-sender))))
-      
+    (let ((contributor (try! (get-contributor-data tx-sender))))
       (match (map-get? proposals proposal-id)
         proposal-data
         (let (
           (vote-key {proposal-id: proposal-id, voter: tx-sender})
+          (last-id (get last-contribution-proposal-id contributor))
+          (voter-weight (get amount contributor))
         )
+          (asserts! (<= last-id proposal-id) (err ERR_WEIGHT_AFTER_SNAPSHOT))
           (asserts! (is-proposal-active proposal-data) (err ERR_PROPOSAL_EXPIRED))
           (asserts! (is-none (map-get? votes vote-key)) (err ERR_ALREADY_VOTED))
           
@@ -261,6 +272,35 @@
         
         ;; Execute the transfer
         (try! (as-contract (stx-transfer? proposal-amount tx-sender proposal-recipient)))
+        
+        ;; Reduce recorded voting weight for recipients drawing from the treasury
+        (match (map-get? contributors proposal-recipient)
+          recipient-data
+          (let (
+            (current-amount (get amount recipient-data))
+            (deduction (if (> proposal-amount current-amount) current-amount proposal-amount))
+          )
+            (if (> deduction u0)
+              (let (
+                (current-total (var-get total-contributions))
+                (new-total (if (> current-total deduction) (- current-total deduction) u0))
+                (new-amount (- current-amount deduction))
+                (last-id (get last-contribution-proposal-id recipient-data))
+                (still-contributor (if (> new-amount u0) true false))
+              )
+                (map-set contributors proposal-recipient {
+                  contributed: still-contributor,
+                  amount: new-amount,
+                  last-contribution-proposal-id: last-id
+                })
+                (var-set total-contributions new-total)
+                u0
+              )
+              u0
+            )
+          )
+          u0
+        )
         
         ;; Mark proposal as executed
         (map-set proposals proposal-id (merge proposal-data {executed: true}))
